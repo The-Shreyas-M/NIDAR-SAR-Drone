@@ -1,0 +1,16 @@
+[Unit]
+Description=NIDAR Wi-Fi fallback to AP when no known network is reachable
+After=NetworkManager.service network-online.target
+Wants=NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=STA_GRACE=5 STA_SETTLE=15
+ExecStart=/usr/local/bin/nidar-wifi-fallback
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

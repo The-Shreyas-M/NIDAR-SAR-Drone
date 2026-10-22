@@ -1,0 +1,17 @@
+# Large recording artifacts (regenerate with ros/record_video_bag.sh)
+*.mcap
+*.mp4
+*.db3
+*.db3-shm
+*.db3-wal
+
+# Bag metadata describing ignored .mcap files
+bags/**/metadata.yaml
+
+# Keep small evidence frames
+!bags/**/sample_frame_*.jpg
+
+# Local tooling
+__pycache__/
+*.pyc
+.venv/

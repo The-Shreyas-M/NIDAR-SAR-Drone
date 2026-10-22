@@ -1,0 +1,375 @@
+#!/usr/bin/python3
+"""NIDAR Wi-Fi setup portal.
+
+Serves a page on the Pi (port 80) to scan for Wi-Fi networks and join one.
+Designed to be used via the NIDAR-AP hotspot at http://192.168.50.1/
+Stdlib only. Runs as root (systemd) so nmcli needs no extra auth.
+"""
+import json
+import os
+import re
+import subprocess
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+BIND = os.environ.get("PORTAL_BIND", "0.0.0.0")
+PORT = int(os.environ.get("PORTAL_PORT", "80"))
+AP_CON = os.environ.get("AP_CON", "NIDAR-AP")
+AP_SSID = os.environ.get("AP_SSID", "NIDAR-AP")
+HOLD = os.environ.get("HOLD_FILE", "/run/nidar-ap-hold")
+IFACE = os.environ.get("WIFI_IFACE", "wlan0")
+MAX_BODY = 16 * 1024
+UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
+
+
+def nm(*args, timeout=20):
+    try:
+        p = subprocess.run(["nmcli", *args], capture_output=True,
+                           text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", "nmcli timed out"
+
+
+def split_terse(line):
+    """Split nmcli -t output on unescaped colons, unescaping \\: and \\\\."""
+    parts, cur, esc = [], "", False
+    for ch in line:
+        if esc:
+            cur += ch
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == ":":
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    parts.append(cur)
+    return parts
+
+
+def scan_wifi():
+    rc, out, err = nm("-t", "-f", "CHAN,SIGNAL,SECURITY,SSID",
+                      "device", "wifi", "list", "--rescan", "yes",
+                      timeout=40)
+    if rc != 0:
+        return None, (err or out or "scan failed")
+    best = {}
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = split_terse(line)
+        if len(parts) < 4:
+            continue
+        try:
+            signal = int(parts[1] or 0)
+        except ValueError:
+            signal = 0
+        ssid = ":".join(parts[3:])
+        if not ssid or ssid == AP_SSID:
+            continue
+        sec = parts[2] if parts[2] not in ("", "--") else "Open"
+        if ssid not in best or signal > best[ssid]["signal"]:
+            best[ssid] = {"ssid": ssid, "signal": signal,
+                          "security": sec, "chan": parts[0]}
+    nets = sorted(best.values(), key=lambda n: n["signal"], reverse=True)
+    return nets, None
+
+
+def get_status():
+    _, dev_out, _ = nm("-t", "-f", "DEVICE,TYPE,STATE,CONNECTION",
+                       "device", "status")
+    devices = []
+    for line in dev_out.splitlines():
+        p = split_terse(line)
+        if len(p) >= 4:
+            devices.append({"device": p[0], "type": p[1],
+                            "state": p[2], "connection": ":".join(p[3:])})
+    _, act_out, _ = nm("-t", "-f", "NAME,UUID,TYPE,DEVICE",
+                       "connection", "show", "--active")
+    active = []
+    for line in act_out.splitlines():
+        p = split_terse(line)
+        if len(p) >= 4:
+            active.append({"name": p[0], "uuid": p[1],
+                           "type": p[2], "device": ":".join(p[3:])})
+    wlan_ip = ""
+    _, ip_out, _ = nm("-t", "-f", "IP4.ADDRESS", "device", "show", IFACE)
+    m = re.search(r"(\d+\.\d+\.\d+\.\d+/\d+)", ip_out)
+    if m:
+        wlan_ip = m.group(1)
+    ap_up = any(a["name"] == AP_CON and a["device"] == IFACE for a in active)
+    sta = next((a["name"] for a in active
+                if a["type"] == "802-11-wireless" and a["device"] == IFACE
+                and a["name"] != AP_CON), "")
+    return {"devices": devices, "active": active, "ap_up": ap_up,
+            "sta_connection": sta, "wlan_ip": wlan_ip,
+            "ap_con": AP_CON, "iface": IFACE}
+
+
+def get_saved():
+    _, out, _ = nm("-t", "-f", "NAME,UUID,TYPE", "connection", "show")
+    saved = []
+    for line in out.splitlines():
+        p = split_terse(line)
+        if len(p) >= 3 and p[2] == "802-11-wireless" and p[0] != AP_CON:
+            _, ssid_out, _ = nm("-t", "-f", "802-11-wireless.ssid",
+                                "connection", "show", p[1])
+            ssid = p[0]
+            if ssid_out:
+                sp = split_terse(ssid_out.splitlines()[0])
+                if len(sp) >= 2:
+                    ssid = ":".join(sp[1:])
+            saved.append({"name": p[0], "uuid": p[1], "ssid": ssid})
+    return saved
+
+
+PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NIDAR Drone Wi-Fi Setup</title>
+<style>
+*{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;
+margin:0;background:#0f172a;color:#e2e8f0;padding:16px;max-width:640px;margin:auto}
+h1{font-size:1.3rem}h2{font-size:1.05rem;margin-top:1.6em}
+.card{background:#1e293b;border-radius:12px;padding:14px;margin:10px 0}
+button{background:#0284c7;color:#fff;border:0;border-radius:8px;padding:10px 16px;
+font-size:1rem;cursor:pointer}button:disabled{opacity:.5}
+button.danger{background:#b91c1c}button.small{padding:6px 12px;font-size:.9rem}
+input{width:100%;padding:10px;border-radius:8px;border:1px solid #475569;
+background:#0f172a;color:#fff;font-size:1rem;margin:6px 0}
+.net{display:flex;align-items:center;gap:10px;padding:10px 0;
+border-top:1px solid #334155}.net .nm{flex:1}.sig{color:#4ade80;font-size:.85rem}
+.sec{color:#94a3b8;font-size:.8rem}.ok{color:#4ade80}.err{color:#f87171}
+.warn{background:#451a03;border:1px solid #ea580c;border-radius:8px;padding:10px;
+margin:10px 0;font-size:.9rem}.muted{color:#94a3b8;font-size:.85rem}
+.row{display:flex;gap:8px;align-items:center}
+</style>
+</head>
+<body>
+<h1>NIDAR Drone &mdash; Wi-Fi Setup</h1>
+<div id="status" class="card">Loading status&hellip;</div>
+<div id="msg"></div>
+<h2>Available networks</h2>
+<div class="card">
+<button id="scanBtn" onclick="scan()">Scan for Wi-Fi</button>
+<span id="scanInfo" class="muted"></span>
+<div id="nets"></div>
+</div>
+<h2>Saved networks</h2>
+<div class="card"><div id="saved"></div></div>
+<script>
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  const t = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(t.error || ('HTTP '+r.status));
+  return t;
+}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+ .replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+async function refresh(){
+  try{
+    const s = await api('/api/status');
+    const sta = s.sta_connection ? 'Connected: <b class="ok">'+esc(s.sta_connection)+'</b>'
+      : 'Not connected as client';
+    const ap = s.ap_up ? 'Hotspot <b class="ok">ON</b> ('+esc(s.wlan_ip||'')+')'
+      : 'Hotspot off';
+    document.getElementById('status').innerHTML = sta+'<br>'+ap;
+    const sv = await api('/api/saved');
+    window._saved = sv.saved;
+    document.getElementById('saved').innerHTML = sv.saved.length ?
+      sv.saved.map((n,si)=>'<div class="net"><div class="nm"><b>'+esc(n.ssid)+
+        '</b><br><span class="muted">'+esc(n.name)+'</span></div>'+
+        '<button class="small danger" onclick="forgetNetwork('+si+
+        ')">Forget</button></div>').join('')
+      : '<span class="muted">No saved networks.</span>';
+  }catch(e){
+    document.getElementById('status').innerHTML =
+      '<span class="err">Portal unreachable: '+esc(e.message)+'</span>';
+  }
+}
+async function scan(){
+  const b=document.getElementById('scanBtn'); b.disabled=true;
+  document.getElementById('scanInfo').textContent='Scanning (~10s)...';
+  try{
+    const r = await api('/api/scan');
+    document.getElementById('scanInfo').textContent =
+      r.networks.length+' network(s) found';
+    document.getElementById('nets').innerHTML = r.networks.map((n,i)=>
+      '<div class="net"><div class="nm"><b>'+esc(n.ssid)+'</b><br>'+
+      '<span class="sig">'+n.signal+'%</span> <span class="sec">'+
+      esc(n.security)+'</span></div>'+
+      '<button class="small" onclick="showJoin('+i+')">Join</button></div>'+
+      '<div id="join'+i+'" style="display:none"><div class="row">'+
+      (n.security==='Open'?'':'<input type="password" id="pw'+i+
+      '" placeholder="Wi-Fi password" autocomplete="off">')+
+      '<button onclick="join('+i+')">Connect</button>'+
+      '</div></div>').join('') || '<span class="muted">None found.</span>';
+    window._nets = r.networks;
+  }catch(e){ showMsg('Scan failed: '+e.message, true); }
+  b.disabled=false;
+}
+function showJoin(i){
+  const d=document.getElementById('join'+i);
+  d.style.display = d.style.display==='none' ? 'block' : 'none';
+}
+async function join(i){
+  const n = (window._nets||[])[i];
+  if(!n) return;
+  const ssid = n.ssid, sec = n.security;
+  let pw='';
+  if(sec!=='Open'){
+    pw=document.getElementById('pw'+i).value;
+    if(!pw){ showMsg('Enter the Wi-Fi password first.', true); return; }
+  }
+  if(!confirm('Connect drone to "'+ssid+
+    '"? The NIDAR-AP hotspot will go down and you will lose this page.')) return;
+  showMsg('Connecting to '+esc(ssid)+'... hotspot will drop if it succeeds. '+
+    'Then join that network yourself to reach the drone.', false);
+  try{
+    const ctl = new AbortController();
+    const t = setTimeout(()=>ctl.abort(), 70000);
+    const r = await fetch('/api/connect',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ssid:ssid,password:pw}), signal:ctl.signal});
+    clearTimeout(t);
+    const j = await r.json().catch(()=>({}));
+    if(r.ok) showMsg('Connected to '+esc(ssid)+' ('+(j.wlan_ip||'no IP yet')+
+      '). Hotspot is down; join "'+esc(ssid)+'" to continue.', false);
+    else showMsg('Failed: '+(j.error||r.status)+
+      (j.ap_restored?' Hotspot was restored.':''), true);
+  }catch(e){
+    showMsg('No response (likely connected &mdash; hotspot is down). '+
+      'Join "'+esc(ssid)+'" on this device to verify.', false);
+  }
+  refresh();
+}
+async function forgetNetwork(si){
+  const n = (window._saved||[])[si];
+  if(!n) return;
+  const uuid = n.uuid, ssid = n.ssid;
+  if(!confirm('Forget "'+ssid+'"? The drone will no longer auto-join it.')) return;
+  try{ await api('/api/forget',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({uuid:uuid})}); showMsg('Forgot '+esc(ssid)+'.', false);
+  }catch(e){ showMsg('Forget failed: '+e.message, true); }
+  refresh();
+}
+function showMsg(t, isErr){
+  document.getElementById('msg').innerHTML =
+    '<div class="'+(isErr?'err':'ok')+' card">'+t+'</div>';
+}
+refresh(); setInterval(refresh, 8000);
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "NIDAR-Portal/1.0"
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, obj, ctype="application/json"):
+        body = obj if isinstance(obj, bytes) else json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > MAX_BODY:
+            return None
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8", "replace"))
+        except (ValueError, UnicodeError):
+            return None
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path in ("/", "/index.html"):
+            self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+        elif path == "/api/status":
+            self._send(200, get_status())
+        elif path == "/api/scan":
+            nets, err = scan_wifi()
+            if nets is None:
+                self._send(502, {"error": err})
+            else:
+                self._send(200, {"networks": nets})
+        elif path == "/api/saved":
+            self._send(200, {"saved": get_saved()})
+        else:
+            self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path == "/api/connect":
+            data = self._body()
+            if not data or not data.get("ssid"):
+                self._send(400, {"error": "ssid required"})
+                return
+            ssid = str(data["ssid"])[:64]
+            password = str(data.get("password") or "")[:128]
+            args = ["device", "wifi", "connect", ssid, "ifname", IFACE]
+            if password:
+                args += ["password", password]
+            rc, out, err = nm(*args, timeout=65)
+            if rc == 0:
+                try:
+                    os.unlink(HOLD)  # manual STA choice: resume auto mode
+                except OSError:
+                    pass
+                st = get_status()
+                self._send(200, {"ok": True, "wlan_ip": st.get("wlan_ip", ""),
+                                 "sta_connection": st.get("sta_connection", "")})
+            else:
+                # Restore hotspot so the operator is not stranded, and pin it
+                # briefly so the watcher doesn't flap back to a failing STA.
+                rc2, _, _ = nm("connection", "up", AP_CON, timeout=30)
+                if rc2 == 0:
+                    try:
+                        open(HOLD, "a").close()
+                    except OSError:
+                        pass
+                self._send(502, {"error": (err or out or "connect failed")[:300],
+                                 "ap_restored": rc2 == 0})
+        elif path == "/api/forget":
+            data = self._body()
+            uuid = str((data or {}).get("uuid") or "")
+            if not UUID_RE.match(uuid):
+                self._send(400, {"error": "bad uuid"})
+                return
+            _, name_out, _ = nm("-t", "-f", "NAME", "connection", "show", uuid)
+            if name_out.strip() == AP_CON:
+                self._send(400, {"error": "cannot forget the hotspot itself"})
+                return
+            rc, out, err = nm("connection", "delete", uuid)
+            if rc == 0:
+                self._send(200, {"ok": True})
+            else:
+                self._send(502, {"error": (err or out or "delete failed")[:200]})
+        else:
+            self._send(404, {"error": "not found"})
+
+
+def main():
+    srv = ThreadingHTTPServer((BIND, PORT), Handler)
+    srv.daemon_threads = True
+    print(f"nidar-portal listening on {BIND}:{PORT}", flush=True)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

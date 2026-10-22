@@ -1,0 +1,52 @@
+#!/bin/bash
+# NIDAR wifi fallback (boot): bring up NIDAR-AP within seconds if no STA connects.
+# Fast path: wait only for NM to settle, never a fixed 40s window.
+set -u
+AP_CON="${AP_CON:-NIDAR-AP}"
+IFACE="${WIFI_IFACE:-wlan0}"
+GRACE="${STA_GRACE:-5}"
+SETTLE="${STA_SETTLE:-15}"
+log() { echo "nidar-wifi-fallback: $*" | systemd-cat -t nidar-wifi-fallback -p info 2>/dev/null || echo "nidar-wifi-fallback: $*"; }
+wlan_line() { nmcli -t -f DEVICE,STATE,CONNECTION device status 2>/dev/null | grep -E "^${IFACE}:" || echo "${IFACE}:unknown:"; }
+# Wait for NetworkManager itself
+for i in $(seq 1 30); do
+  if nmcli -t -f RUNNING general status 2>/dev/null | grep -q running; then break; fi
+  sleep 1
+done
+sleep "$GRACE"
+# Settle loop: give an in-progress STA attempt a few seconds, then decide
+for i in $(seq 1 "$SETTLE"); do
+  line="$(wlan_line)"
+  st="${line#*:}"; st="${st%%:*}"; con="${line#*:*:}"
+  if [ "$st" = "connected" ] && [ -n "$con" ] && [ "$con" != "$AP_CON" ]; then
+    log "STA connected ($con), no fallback needed"
+    exit 0
+  fi
+  if [ "$st" = "connected" ] && [ "$con" = "$AP_CON" ]; then
+    log "AP already up, nothing to do"
+    exit 0
+  fi
+  case "$st" in
+    connecting|unknown|unavailable|deactivating|authenticating|associating)
+      sleep 1; continue ;;
+  esac
+  break
+done
+line="$(wlan_line)"
+st="${line#*:}"; st="${st%%:*}"; con="${line#*:*:}"
+if [ "$st" = "connected" ] && [ -n "$con" ] && [ "$con" != "$AP_CON" ]; then
+  log "STA connected ($con), no fallback needed"
+  exit 0
+fi
+if [ "$st" = "connected" ] && [ "$con" = "$AP_CON" ]; then
+  log "AP already up, nothing to do"
+  exit 0
+fi
+log "no STA connection (state=$st), bringing up $AP_CON"
+if nmcli connection up "$AP_CON"; then
+  log "$AP_CON is up"
+  exit 0
+else
+  log "FAILED to bring up $AP_CON"
+  exit 1
+fi

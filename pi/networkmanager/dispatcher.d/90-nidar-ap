@@ -1,0 +1,21 @@
+#!/bin/sh
+# NM dispatcher: STA dropped -> AP back up within seconds.
+# Never resurrects the AP after a manual `nidar-ap off` (CONNECTION_ID check
+# + hold file), never fights an already-active connection.
+IFACE="wlan0"
+AP_CON="NIDAR-AP"
+HOLD="/run/nidar-ap-hold"
+if [ "$1" != "$IFACE" ]; then exit 0; fi
+case "$2" in down) ;; *) exit 0;; esac
+# Manual AP-off or empty event: do nothing
+if [ -z "${CONNECTION_ID:-}" ]; then exit 0; fi
+if [ "$CONNECTION_ID" = "$AP_CON" ]; then exit 0; fi
+if [ -e "$HOLD" ]; then exit 0; fi
+# Grace: skip if wlan0 already has an active connection (flap/roam)
+sleep 3
+if /usr/bin/nmcli -t -f DEVICE connection show --active 2>/dev/null | /usr/bin/grep -qx "$IFACE"; then
+  exit 0
+fi
+if [ -e "$HOLD" ]; then exit 0; fi
+# Foreground with a bound (dispatcher tolerates a few seconds; nmcli -w caps it)
+exec /usr/bin/nmcli -w 20 connection up "$AP_CON" >/dev/null 2>&1

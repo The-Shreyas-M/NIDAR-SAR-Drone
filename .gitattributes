@@ -1,0 +1,6 @@
+# Pi scripts/services must keep LF endings - CRLF breaks shebangs on Linux.
+* text=auto eol=lf
+
+*.jpg binary
+*.png binary
+*.mp4 binary

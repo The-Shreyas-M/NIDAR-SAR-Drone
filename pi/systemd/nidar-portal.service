@@ -1,0 +1,15 @@
+[Unit]
+Description=NIDAR Wi-Fi setup portal (http://192.168.50.1/ via NIDAR-AP)
+After=NetworkManager.service nidar-wifi-fallback.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/nidar-portal
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

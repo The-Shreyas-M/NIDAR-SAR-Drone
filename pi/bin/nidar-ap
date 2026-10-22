@@ -1,0 +1,61 @@
+#!/bin/bash
+# nidar-ap: manually control the NIDAR-AP hotspot.
+# Usage: sudo nidar-ap on|off|status|toggle|auto   (nmcli needs root/polkit)
+# on/off pin the requested state (hold file, auto-expires); `auto` resumes
+# automatic STA<->AP switching by the watcher.
+set -u
+AP_CON="NIDAR-AP"
+IFACE="wlan0"
+HOLD="/run/nidar-ap-hold"
+HOLD_MIN=15
+cmd="${1:-status}"
+is_up() { nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | grep -q "^${AP_CON}:${IFACE}$"; }
+set_hold() { touch "$HOLD"; }
+clear_hold() { rm -f "$HOLD"; }
+hold_info() {
+  if [ -e "$HOLD" ]; then
+    age_min=$(( ($(date +%s) - $(stat -c %Y "$HOLD")) / 60 ))
+    echo "HOLD=manual (${age_min}m old, expires after ${HOLD_MIN}m idle)"
+  else
+    echo "HOLD=auto"
+  fi
+}
+case "$cmd" in
+  on)
+    if is_up; then echo "$AP_CON already up"; else nmcli connection up "$AP_CON"; fi
+    set_hold
+    ;;
+  off)
+    if ! is_up; then
+      echo "$AP_CON already down, rescanning STA..."
+      nmcli device wifi rescan ifname "$IFACE" 2>/dev/null || true
+    else
+      nmcli connection down "$AP_CON" && nmcli device wifi rescan ifname "$IFACE" 2>/dev/null || true
+    fi
+    set_hold
+    ;;
+  toggle)
+    if is_up; then exec "$0" off; else exec "$0" on; fi
+    ;;
+  auto)
+    clear_hold
+    echo "automatic STA<->AP switching resumed"
+    ;;
+  status)
+    echo "--- active connections ---"
+    nmcli -t -f NAME,TYPE,DEVICE connection show --active
+    echo "--- devices ---"
+    nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status | grep -E "wlan0|eth0"
+    if is_up; then
+      echo "AP_STATUS=up"
+      ip -4 addr show "$IFACE" | grep -E "inet "
+    else
+      echo "AP_STATUS=down"
+    fi
+    hold_info
+    ;;
+  *)
+    echo "Usage: sudo $0 on|off|status|toggle|auto" >&2
+    exit 2
+    ;;
+esac

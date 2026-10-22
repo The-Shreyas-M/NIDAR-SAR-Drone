@@ -1,0 +1,194 @@
+#!/usr/bin/python3
+"""nidar-wifi-watch: keep the drone reachable.
+
+Every WATCH_INTERVAL seconds (default 5):
+  - STA connected -> do nothing.
+  - AP up -> every WATCH_SCAN_EVERY ticks, scan; if a known saved STA
+    network is visible, switch to the highest-priority one.
+  - wlan0 down with no connection -> bring NIDAR-AP up immediately.
+Manual override: /run/nidar-ap-hold (set by `nidar-ap on|off`, cleared by
+`nidar-ap auto`). While the hold file is fresh, the watcher does nothing.
+Stdlib only, runs as root via systemd.
+"""
+import os
+import re
+import subprocess
+import time
+import sys
+
+AP_CON = os.environ.get("AP_CON", "NIDAR-AP")
+AP_SSID = os.environ.get("AP_SSID", "NIDAR-AP")
+IFACE = os.environ.get("WIFI_IFACE", "wlan0")
+INTERVAL = int(os.environ.get("WATCH_INTERVAL", "5"))
+SCAN_EVERY = int(os.environ.get("WATCH_SCAN_EVERY", "3"))
+START_DELAY = int(os.environ.get("WATCH_START_DELAY", "10"))
+HOLD = os.environ.get("HOLD_FILE", "/run/nidar-ap-hold")
+HOLD_MIN = int(os.environ.get("HOLD_MINUTES", "15"))
+UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
+
+
+def log(msg):
+    print(f"nidar-wifi-watch: {msg}", flush=True)
+
+
+def nm(*args, timeout=20):
+    try:
+        p = subprocess.run(["nmcli", *args], capture_output=True,
+                           text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", "nmcli timed out"
+
+
+def split_terse(line):
+    parts, cur, esc = [], "", False
+    for ch in line:
+        if esc:
+            cur += ch
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == ":":
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    parts.append(cur)
+    return parts
+
+
+def hold_active():
+    try:
+        age = time.time() - os.path.getmtime(HOLD)
+        return age < HOLD_MIN * 60
+    except OSError:
+        return False
+
+
+def wlan_state():
+    """Return (state, connection) for IFACE."""
+    _, out, _ = nm("-t", "-f", "DEVICE,STATE,CONNECTION", "device", "status")
+    for line in out.splitlines():
+        p = split_terse(line)
+        if p and p[0] == IFACE:
+            state = p[1] if len(p) > 1 else "unknown"
+            con = ":".join(p[2:]) if len(p) > 2 else ""
+            return state, con
+    return "unknown", ""
+
+
+def wlan_has_active():
+    _, out, _ = nm("-t", "-f", "DEVICE", "connection", "show", "--active")
+    return any(l.strip() == IFACE for l in out.splitlines())
+
+
+def known_sta():
+    """List dicts of saved STA wifi profiles: name/uuid/ssid/priority."""
+    _, out, _ = nm("-t", "-f", "NAME,UUID,TYPE", "connection", "show")
+    profiles = []
+    for line in out.splitlines():
+        p = split_terse(line)
+        if len(p) < 3 or p[2] != "802-11-wireless" or p[0] == AP_CON:
+            continue
+        uuid = p[1]
+        if not UUID_RE.match(uuid):
+            continue
+        _, ac_out, _ = nm("-t", "-f", "connection.autoconnect",
+                          "connection", "show", uuid)
+        if "no" in ac_out.split(":")[-1].strip().lower():
+            continue
+        _, ssid_out, _ = nm("-t", "-f", "802-11-wireless.ssid",
+                            "connection", "show", uuid)
+        ssid = p[0]
+        if ssid_out:
+            sp = split_terse(ssid_out.splitlines()[0])
+            if len(sp) >= 2:
+                ssid = ":".join(sp[1:])
+        _, prio_out, _ = nm("-t", "-f", "connection.autoconnect-priority",
+                            "connection", "show", uuid)
+        try:
+            prio = int(prio_out.split(":")[-1].strip())
+        except ValueError:
+            prio = 0
+        profiles.append({"name": p[0], "uuid": uuid,
+                         "ssid": ssid, "priority": prio})
+    return profiles
+
+
+def scan_ssids():
+    rc, out, err = nm("-t", "-f", "CHAN,SIGNAL,SECURITY,SSID",
+                      "device", "wifi", "list", "--rescan", "yes",
+                      timeout=40)
+    if rc != 0:
+        log(f"scan failed: {(err or out)[:120]}")
+        return set()
+    found = set()
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        p = split_terse(line)
+        if len(p) < 4:
+            continue
+        ssid = ":".join(p[3:])
+        if ssid and ssid != AP_SSID:
+            found.add(ssid)
+    return found
+
+
+def maybe_flip_to_sta():
+    try:
+        visible = scan_ssids()
+    except Exception as e:
+        log(f"scan exception: {e}")
+        return
+    if not visible:
+        return
+    cands = [k for k in known_sta() if k["ssid"] in visible]
+    if not cands:
+        return
+    best = max(cands, key=lambda k: k["priority"])
+    log(f"known network visible ({best['ssid']}), switching from AP to STA")
+    rc, _, err = nm("connection", "up", best["name"], timeout=45)
+    if rc == 0:
+        log(f"STA up ({best['name']})")
+    else:
+        log(f"STA switch failed: {err[:150]}")
+
+
+def main():
+    for _ in range(30):
+        rc, out, _ = nm("-t", "-f", "RUNNING", "general", "status")
+        if rc == 0 and "running" in out:
+            break
+        time.sleep(1)
+    log(f"started (interval={INTERVAL}s, start-delay={START_DELAY}s)")
+    time.sleep(START_DELAY)
+    tick = 0
+    while True:
+        try:
+            time.sleep(INTERVAL)
+            if hold_active():
+                continue
+            state, con = wlan_state()
+            if state == "connected" and con and con != AP_CON:
+                continue  # STA healthy
+            if state == "connected" and con == AP_CON:
+                tick += 1
+                if tick % SCAN_EVERY == 0:
+                    maybe_flip_to_sta()
+                continue
+            if state in ("connecting", "deactivating", "authenticating",
+                         "associating", "config", "need_auth", "prepare"):
+                continue  # transition in progress, don't stomp it
+            if wlan_has_active():
+                continue
+            log(f"wlan0 {state} with no connection, bringing up {AP_CON}")
+            rc, _, err = nm("connection", "up", AP_CON, timeout=30)
+            log(f"{AP_CON} up" if rc == 0 else f"AP up failed: {err[:150]}")
+        except Exception as e:
+            log(f"loop exception: {e}")
+            time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    main()

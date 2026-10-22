@@ -1,0 +1,16 @@
+[Unit]
+Description=NIDAR Wi-Fi watcher (AP up when STA down, flip to STA when known net appears)
+After=NetworkManager.service nidar-wifi-fallback.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/nidar-wifi-watch
+Environment=WATCH_INTERVAL=5 WATCH_SCAN_EVERY=3 WATCH_START_DELAY=10
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
