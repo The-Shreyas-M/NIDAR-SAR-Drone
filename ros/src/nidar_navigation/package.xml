@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>nidar_navigation</name>
+  <version>0.1.0</version>
+  <description>Navigation, landing, mission state machine for NIDAR</description>
+  <maintainer email="user@example.com">user</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>rclpy</depend>
+  <depend>nidar_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>mavros_msgs</depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

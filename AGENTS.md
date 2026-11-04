@@ -92,6 +92,17 @@
 - 640x480 @ 20fps → ~74 MB per 2 min. Bump resolution/fps only deliberately.
 - Sample: `bags/sar_2min_video/` (bag + mp4 + one raw frame).
 
+## ROS 2 workspace on the Pi (verified build 2026-11-04)
+- Workspace: `~/nidar_ws` (src in repo at `ros/src/`). Build: `cd ~/nidar_ws && source /opt/ros/lyrical/setup.bash && colcon build --symlink-install`.
+- 9 packages: nidar_msgs, nidar_bringup, nidar_camera, nidar_lidar, nidar_flight, nidar_gcs, nidar_navigation, nidar_perception, nidar_slam.
+- Launch: `ros2 launch nidar_bringup onboard.launch.py fcu_url:=/dev/ttyAMA0:921600` (MAVROS apm, RPLidar C1, IMX500, EKF, SLAM, ArUco, mission manager).
+- MAVROS uses `apm.launch` (ArduPilot). FC via UART on `/dev/ttyAMA0` (override with fcu_url arg).
+- LiDAR package: `lgdx_rplidar_c1`, executable `rplidar_c1_node`.
+- Custom messages in `nidar_msgs`: PersonDetection, PersonDetectionArray, MissionCommand, LaunchpadPose.
+- Entry points: imx500_detector, imx500_video_publisher, aruco_detector, person_fusion, offboard_control, mission_manager, gcs_node.
+- Node stubs only - real logic TBD per phase. SLAM config in nidar_slam/config/slam_toolbox.yaml.
+- FC permission: user in dialout group (needed for UART). LiDAR not yet connected (/dev/ttyUSB0 absent).
+
 ## Rules for future sessions
 - Pi is the executable source of truth. Before writing Netplan /
   NetworkManager / `hostapd` / `dnsmasq` config, SSH in and check what the Pi
