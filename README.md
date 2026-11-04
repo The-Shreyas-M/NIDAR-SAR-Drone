@@ -101,6 +101,29 @@ git-ignored — regenerate them with the scripts above.
   faces blue.
 - IMX500 firmware upload takes 5–20s; wait for the topic, don't `sleep` blindly.
 
+## Workspace setup (verified on Pi 2026-11-04)
+
+```bash
+# On Pi — build (first time or after changes)
+cd ~/nidar_ws && source /opt/ros/lyrical/setup.bash && colcon build --symlink-install
+# or use the convenience script:
+~/build_nidar.sh
+
+# Launch everything
+ros2 launch nidar_bringup onboard.launch.py fcu_url:=/dev/ttyAMA0:921600
+
+# GCS side (separate machine)
+ros2 launch nidar_bringup gcs.launch.py
+```
+
+- 9 packages: nidar_msgs, nidar_bringup, nidar_camera, nidar_lidar, nidar_flight,
+  nidar_gcs, nidar_navigation, nidar_perception, nidar_slam
+- Custom messages: PersonDetection, PersonDetectionArray, MissionCommand, LaunchpadPose
+- Entry points: imx500_detector, imx500_video_publisher, aruco_detector,
+  person_fusion, offboard_control, mission_manager, gcs_node
+- `.bashrc` auto-sources ROS 2 + workspace. `ROS_DOMAIN_ID=21`.
+- Node logic is stubs — real implementation per phase (see TODO.md)
+
 ## Repo state
 
 No app code yet — this repo currently holds docs only (`README.md`,

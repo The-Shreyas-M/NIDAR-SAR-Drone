@@ -102,6 +102,8 @@
 - Entry points: imx500_detector, imx500_video_publisher, aruco_detector, person_fusion, offboard_control, mission_manager, gcs_node.
 - Node stubs only - real logic TBD per phase. SLAM config in nidar_slam/config/slam_toolbox.yaml.
 - FC permission: user in dialout group (needed for UART). LiDAR not yet connected (/dev/ttyUSB0 absent).
+- Workspace: `~/nidar_ws` on Pi, src in repo at `ros/src/`. Build: `cd ~/nidar_ws && source /opt/ros/lyrical/setup.bash && colcon build --symlink-install`.
+- `.bashrc` auto-sources ROS 2 + workspace. `~/build_nidar.sh` for rebuilds. `ROS_DOMAIN_ID=21`.
 
 ## Rules for future sessions
 - Pi is the executable source of truth. Before writing Netplan /
